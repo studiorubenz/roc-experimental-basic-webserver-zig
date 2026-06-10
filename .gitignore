@@ -1,0 +1,9 @@
+.claude/
+.zig-cache/
+main
+zig-pkg/
+zig-out/
+examples/*/elm.js
+elm-stuff/
+__pycache__/
+.gif-frames/

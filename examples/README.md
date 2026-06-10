@@ -23,11 +23,13 @@ roc build examples/app/main.roc && ./main
   messages go to everyone, `/me` actions broadcast, `/help` is private.
 - `websocket-elm/` — the same chat with an Elm frontend. `build.sh` compiles
   `src/Main.elm` first (any example with a `src/Main.elm` gets this step);
-  the compiled `elm.js` is embedded into the Roc binary at build time via an
-  ingested import (`import "elm.js" as elm_js : Str`) and served from
-  memory — no file IO at runtime. Elm talks to the socket through ports
-  (Elm 0.19 has no built-in WebSockets). Note: `roc check` needs `elm.js`
-  to exist, so run `elm make` (or build.sh) once first.
+  the server reads the compiled `elm.js` from disk per request
+  (`File.read_bytes!`), so you can re-run `elm make` and just refresh the
+  browser — no server rebuild. Elm talks to the socket through ports
+  (Elm 0.19 has no built-in WebSockets). Alternative technique: embedding
+  the bundle at build time via an ingested import
+  (`import "elm.js" as elm_js : Str`) also works at this pin, at the cost
+  of a build-time dependency on the asset.
 
 Every app must export both `handle! : Request => Response` (HTTP) and
 `on_ws! : { message : Str, path : Str } => { broadcast : Str, reply : Str }`

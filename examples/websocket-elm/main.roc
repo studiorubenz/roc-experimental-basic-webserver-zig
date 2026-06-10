@@ -1,12 +1,17 @@
 app [handle!, on_ws!] { pf: platform "../../platform/main.roc" }
 
 import pf.Stdout
+import pf.File
 import pf.Request exposing [Request]
 import pf.Response exposing [Response]
 
-# The compiled Elm app, embedded at build time (build.sh runs `elm make`
-# before `roc build`). No file IO needed at runtime.
-import "elm.js" as elm_js : Str
+# The compiled Elm bundle is read from disk per request (the server runs
+# from the repo root, hence the examples/... path). Re-run `elm make` and
+# refresh the browser — no server rebuild needed. Before the platform had
+# File I/O this was embedded at build time via an ingested import
+# (`import "elm.js" as elm_js : Str`), which also works.
+elm_js_path : Str
+elm_js_path = "examples/websocket-elm/elm.js"
 
 # -- HTTP: serve the page and the embedded Elm bundle ---------------------------
 
@@ -19,9 +24,16 @@ handle! = |request| {
                 .with_headers([("Content-Type", "text/html; charset=utf-8")])
                 .with_body(page.to_utf8())
         "/elm.js" =>
-            Response.from_status(200)
-                .with_headers([("Content-Type", "application/javascript; charset=utf-8")])
-                .with_body(elm_js.to_utf8())
+            match File.read_bytes!(elm_js_path) {
+                Ok(bytes) =>
+                    Response.from_status(200)
+                        .with_headers([("Content-Type", "application/javascript; charset=utf-8")])
+                        .with_body(bytes)
+                Err(FileErr(_)) =>
+                    Response.from_status(503)
+                        .with_headers([("Content-Type", "text/plain")])
+                        .with_body("elm.js missing — run: cd examples/websocket-elm && elm make src/Main.elm --output=elm.js --optimize".to_utf8())
+            }
         _ =>
             Response.from_status(404)
                 .with_headers([("Content-Type", "text/plain")])

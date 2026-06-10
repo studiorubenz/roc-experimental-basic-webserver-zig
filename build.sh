@@ -35,8 +35,14 @@ if [[ -f "$APP/src/Main.elm" ]]; then
     (cd "$APP" && elm make src/Main.elm --output=elm.js --optimize)
 fi
 
-echo "Building host library..."
-"$ZIG" build arm64mac
+case "$(uname -sm)" in
+    "Darwin arm64") TARGET=arm64mac ;;
+    "Darwin x86_64") TARGET=x64mac ;;  # cross-compiles cleanly; untested at runtime
+    *) echo "Unsupported host: $(uname -sm) (see README, Other targets)" >&2; exit 1 ;;
+esac
+
+echo "Building host library ($TARGET)..."
+"$ZIG" build "$TARGET"
 
 echo "Building Roc app (standalone binary): $APP ..."
 "$ROC" build "$APP/main.roc"

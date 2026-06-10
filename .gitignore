@@ -7,3 +7,4 @@ examples/*/elm.js
 elm-stuff/
 __pycache__/
 .gif-frames/
+platform/targets/x64mac/

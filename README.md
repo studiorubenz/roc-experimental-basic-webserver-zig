@@ -55,7 +55,7 @@ opposite conclusion.
 
 Requirements:
 
-- macOS on Apple Silicon
+- macOS on Apple Silicon (Intel *should* work too — see "Other targets")
 - [Zig 0.16.0](https://ziglang.org/download/)
 - The Roc compiler **built from source at commit `48b28c07`**, checked out
   as a sibling directory of this repo named `roc-48b28c07`
@@ -81,6 +81,31 @@ The `websocket-elm` example additionally needs [Elm 0.19](https://elm-lang.org).
 > exactly this pin. Nightlies exist at
 > [roc-lang/nightlies](https://github.com/roc-lang/nightlies) and are the
 > likely future pin source.
+
+## Other targets (untested!)
+
+The build system knows four targets (`arm64mac`, `x64mac`, `arm64musl`,
+`x64musl`), but only **arm64mac** has ever actually been run.
+
+**Intel Mac** — expected to work, never tested. The host cross-compiles
+with zero errors and uses no architecture-specific code; `build.sh`
+auto-detects the architecture, so the normal quick start applies as-is.
+To produce the static library alone: `zig build x64mac` (lands in
+`platform/targets/x64mac/libhost.a`). Reports welcome!
+
+**Linux (musl)** — does not build yet, but the gap is small and known.
+`zig build x64musl` currently fails on exactly three darwin-isms in
+`platform/host.zig`:
+
+1. `dirent.namlen` doesn't exist on Linux (use `strlen` of the
+   null-terminated `name` instead) — two call sites
+2. one errno-enum member name differs (`.OPNOTSUPP` arm of the
+   `IOErr` mapping switch)
+3. `_NSGetExecutablePath` would fail at link time
+   (use `readlink("/proc/self/exe")`)
+
+The musl target entries (including `crt1.o`/`libc.a`) are already declared
+in `platform/main.roc`. If you port it, a PR would be very welcome.
 
 ## Examples
 

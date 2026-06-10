@@ -4,6 +4,7 @@ import pf.Stdout
 import pf.Cmd
 import pf.Dir
 import pf.Env
+import pf.IOErr exposing [IOErr]
 import pf.File
 import pf.Random
 import pf.Sleep
@@ -44,11 +45,23 @@ handle! = |request| {
     }
 }
 
-## Demo page for the Phase 1 platform effects: Env, Utc, Sleep, Random.
+## Demo page for the platform effects: Env, Utc, Sleep, Random, File, Dir, Cmd.
 render_system! : {} => Response
 render_system! = |{}| {
+    match system_rows!({}) {
+        Ok(rows) => html_response(200, "System", headers_table(rows))
+        Err(_) => html_response(500, "System", "<p>a system probe failed unexpectedly</p>")
+    }
+}
+
+## Gather one table row per effect. Happy-path style: `?` propagates any
+## unexpected error to render_system!'s single match above.
+system_rows! : {} => Try(List((Str, Str)), [RandomErr(IOErr)])
+system_rows! = |{}| {
     start = Utc.now!({})
 
+    # These two matches are deliberate, not pyramid debt: the page exists to
+    # SHOW both branches of Env.var! (a set and an unset variable).
     home = match Env.var!("HOME") {
         Ok(value) => value
         Err(VarNotFound(name)) => "Err(VarNotFound(${name}))"
@@ -57,29 +70,20 @@ render_system! = |{}| {
         Ok(value) => value
         Err(VarNotFound(name)) => "Err(VarNotFound(${name}))"
     }
-    cwd = match Env.cwd!({}) {
-        Ok(value) => value
-        Err(CwdUnavailable) => "(unavailable)"
-    }
-    exe = match Env.exe_path!({}) {
-        Ok(value) => value
-        Err(ExePathUnavailable) => "(unavailable)"
-    }
-    seed_64 = match Random.seed_u64!({}) {
-        Ok(n) => n.to_str()
-        Err(RandomErr(_)) => "(random error)"
-    }
-    seed_32 = match Random.seed_u32!({}) {
-        Ok(n) => n.to_str()
-        Err(RandomErr(_)) => "(random error)"
-    }
+    cwd = Env.cwd!({}) ?? "(unavailable)"
+    exe = Env.exe_path!({}) ?? "(unavailable)"
+    seed_64 = Random.seed_u64!({})?
+    seed_32 = Random.seed_u32!({})?
+    # Handlers run in parallel, so each request probes its own temp paths
+    # (a shared path would race with concurrent /system requests).
+    unique = seed_64.to_str()
 
     Sleep.millis!(2)
     end = Utc.now!({})
 
-    rows = [
-        ("File roundtrip", file_roundtrip!({})),
-        ("Dir roundtrip", dir_roundtrip!({})),
+    Ok([
+        ("File roundtrip", file_roundtrip!(unique)),
+        ("Dir roundtrip", dir_roundtrip!(unique)),
         ("Cmd roundtrip", cmd_roundtrip!({})),
         ("Utc.now! (nanos since epoch)", start.to_str()),
         ("Utc.to_millis_since_epoch", Utc.to_millis_since_epoch(start).to_str()),
@@ -87,99 +91,95 @@ render_system! = |{}| {
         ("Env.var! on an unset name", missing),
         ("Env.cwd!", cwd),
         ("Env.exe_path!", exe),
-        ("Random.seed_u64!", seed_64),
-        ("Random.seed_u32!", seed_32),
+        ("Random.seed_u64!", seed_64.to_str()),
+        ("Random.seed_u32!", seed_32.to_str()),
         ("Sleep.millis!(2), measured", "${Utc.delta_as_nanos(start, end).to_str()} ns"),
-    ]
-    html_response(200, "System", headers_table(rows))
+    ])
 }
 
-## Exercise all five File operations against a temp file and report the result.
-file_roundtrip! : {} => Str
-file_roundtrip! = |{}| {
-    path = "/tmp/roc-webserver-system-probe.txt"
-    match File.write_utf8!(path, "round trip äöü") {
-        Err(FileErr(_)) => "write_utf8 FAILED"
-        Ok({}) =>
-            match File.read_bytes!(path) {
-                Err(FileErr(_)) => "read_bytes FAILED"
-                Ok(bytes) =>
-                    match File.write_bytes!(path, bytes.concat(" + bytes".to_utf8())) {
-                        Err(FileErr(_)) => "write_bytes FAILED"
-                        Ok({}) =>
-                            match File.read_utf8!(path) {
-                                Err(FileErr(_)) => "read_utf8 FAILED"
-                                Ok(content) if content != "round trip äöü + bytes" => "content mismatch: ${content}"
-                                Ok(_) =>
-                                    match File.delete!(path) {
-                                        Err(FileErr(_)) => "delete FAILED"
-                                        Ok({}) =>
-                                            match File.read_utf8!(path) {
-                                                Err(FileErr(NotFound)) => "write/read/append/delete OK, NotFound after delete OK"
-                                                Err(FileErr(_)) => "unexpected error after delete"
-                                                Ok(_) => "file still exists after delete!"
-                                            }
-                                    }
-                            }
-                    }
-            }
+## Exercise all five File operations against a temp file.
+file_roundtrip! : Str => Str
+file_roundtrip! = |unique| {
+    match try_file_roundtrip!(unique) {
+        Ok(message) => message
+        Err(FileErr(_)) => "a File operation FAILED"
+    }
+}
+
+## Happy-path style: every step shares File's error union, so `?` can
+## propagate it; the semantic checks report through the Ok branch. (Mixing
+## FileErr and DirErr steps in one `?` chain would need open `..` unions,
+## which the vendored basic-cli signatures don't have.)
+try_file_roundtrip! : Str => Try(Str, [FileErr(IOErr)])
+try_file_roundtrip! = |unique| {
+    path = "/tmp/roc-webserver-system-probe-${unique}.txt"
+    File.write_utf8!(path, "round trip äöü")?
+    bytes = File.read_bytes!(path)?
+    File.write_bytes!(path, bytes.concat(" + bytes".to_utf8()))?
+    content = File.read_utf8!(path)?
+    if content != "round trip äöü + bytes" {
+        Ok("content mismatch: ${content}")
+    } else {
+        File.delete!(path)?
+        match File.read_utf8!(path) {
+            Err(FileErr(NotFound)) => Ok("write/read/append/delete OK, NotFound after delete OK")
+            Err(FileErr(_)) => Ok("deleted, but re-read gave an unexpected error")
+            Ok(_) => Ok("file still exists after delete!")
+        }
     }
 }
 
 ## Exercise the Cmd API: output capture, exit codes, spawn failure, env vars.
 cmd_roundtrip! : {} => Str
 cmd_roundtrip! = |{}| {
-    output = match Cmd.new("echo").args(["hello", "subprocess"]).exec_output!() {
-        Ok({ stdout_utf8, stderr_utf8_lossy: _ }) => stdout_utf8.trim()
-        Err(_) => "exec_output FAILED"
+    match try_cmd_roundtrip!({}) {
+        Ok(message) => message
+        Err(_) => "a Cmd operation FAILED"
     }
-    exit_code = match Cmd.new("sh").args(["-c", "exit 42"]).exec_exit_code!() {
-        Ok(code) => code.to_str()
-        Err(_) => "exec_exit_code FAILED"
-    }
+}
+
+try_cmd_roundtrip! : {} => Try(Str, _)
+try_cmd_roundtrip! = |{}| {
+    output = Cmd.new("echo").args(["hello", "subprocess"]).exec_output!()?
+    exit_code = Cmd.new("sh").args(["-c", "exit 42"]).exec_exit_code!()?
+
+    # This match is the point of the row: we EXPECT the Err branch here.
     missing = match Cmd.new("definitely-not-a-program-xyz").exec_output!() {
         Err(FailedToGetExitCode({ command: _, err: NotFound })) => "Err(NotFound)"
         Err(_) => "some other error"
         Ok(_) => "unexpectedly Ok"
     }
-    env_check = match Cmd.new("sh").args(["-c", "echo $CMD_PROBE"]).env("CMD_PROBE", "env works").exec_output!() {
-        Ok({ stdout_utf8, stderr_utf8_lossy: _ }) => stdout_utf8.trim()
-        Err(_) => "env FAILED"
-    }
-    "echo -> ${output}; exit 42 -> ${exit_code}; missing program -> ${missing}; ${env_check}"
+
+    env_check = Cmd.new("sh").args(["-c", "echo $CMD_PROBE"]).env("CMD_PROBE", "env works").exec_output!()?
+    Ok("echo -> ${output.stdout_utf8.trim()}; exit 42 -> ${exit_code.to_str()}; missing program -> ${missing}; ${env_check.stdout_utf8.trim()}")
 }
 
-## Exercise all five Dir operations against a temp tree and report the result.
-dir_roundtrip! : {} => Str
-dir_roundtrip! = |{}| {
-    base = "/tmp/roc-webserver-dir-probe"
+## Exercise all five Dir operations against a temp tree.
+dir_roundtrip! : Str => Str
+dir_roundtrip! = |unique| {
+    match try_dir_roundtrip!(unique) {
+        Ok(message) => message
+        Err(DirErr(_)) => "a Dir operation FAILED"
+    }
+}
+
+try_dir_roundtrip! : Str => Try(Str, [DirErr(IOErr)])
+try_dir_roundtrip! = |unique| {
+    base = "/tmp/roc-webserver-dir-probe-${unique}"
     nested = "${base}/a/b"
-    match Dir.create_all!(nested) {
-        Err(DirErr(_)) => "create_all FAILED"
-        Ok({}) =>
-            match Dir.create!("${nested}/c") {
-                Err(DirErr(_)) => "create FAILED"
-                Ok({}) => {
-                    _ = File.write_utf8!("${nested}/file.txt", "x")
-                    match Dir.list!(nested) {
-                        Err(DirErr(_)) => "list FAILED"
-                        Ok(entries) if entries.len() != 2 => "list expected 2 entries, got ${entries.len().to_str()}"
-                        Ok(_) =>
-                            match Dir.delete_empty!("${nested}/c") {
-                                Err(DirErr(_)) => "delete_empty FAILED"
-                                Ok({}) =>
-                                    match Dir.delete_all!(base) {
-                                        Err(DirErr(_)) => "delete_all FAILED"
-                                        Ok({}) =>
-                                            match Dir.list!(base) {
-                                                Err(DirErr(NotFound)) => "create_all/create/list/delete_empty/delete_all OK, NotFound after delete_all OK"
-                                                _ => "directory still listable after delete_all!"
-                                            }
-                                    }
-                            }
-                    }
-                }
-            }
+    Dir.create_all!(nested)?
+    Dir.create!("${nested}/c")?
+    Dir.create!("${nested}/d")?
+    entries = Dir.list!(nested)?
+    if entries.len() != 2 {
+        Ok("list expected 2 entries, got ${entries.len().to_str()}")
+    } else {
+        Dir.delete_empty!("${nested}/c")?
+        Dir.delete_all!(base)?
+        match Dir.list!(base) {
+            Err(DirErr(NotFound)) => Ok("create_all/create/list/delete_empty/delete_all OK, NotFound after delete_all OK")
+            _ => Ok("directory still listable after delete_all!")
+        }
     }
 }
 
@@ -214,6 +214,9 @@ render_notes! = |{}| {
 }
 
 ## Append one note line to the file, then redirect back to /notes.
+## Honest caveat: handlers run in parallel, so two simultaneous posts can
+## race this read-modify-write and one note can be lost. Durable designs
+## use one file per record (unique names) instead of one shared file.
 add_note! : Str => Response
 add_note! = |text| {
     if text.trim() == "" {

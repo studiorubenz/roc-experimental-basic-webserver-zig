@@ -35,8 +35,9 @@ to Roc's new Zig-based compiler**, with the host written in Zig.
 ## What it can't do
 
 - No TLS, no chunked transfer encoding, binds 127.0.0.1 only
-- Calls into Roc are serialized behind one mutex (parallel I/O,
-  sequential handlers) — fine for demos, not for production
+- Handlers run in parallel (no global lock since the post-feedback
+  rework) — which means *your* file read-modify-writes can race; use
+  unique paths per record
 - macOS arm64 only (the host is plain libc, so other targets are
   *probably* a build-matrix problem rather than a code problem)
 - No `Stdin`/`Tty`/`Locale`/`Path` (server-irrelevant or deferred)
@@ -114,18 +115,21 @@ in `platform/main.roc`. If you port it, a PR would be very welcome.
 | `app` | HTTP routing, URL decoding + HTML escaping in Roc, JSON endpoint, `/system` (exercises **every** platform effect incl. File/Dir/Cmd roundtrips), `/notes` (file-backed persistence) |
 | `ws-echo` | WebSocket echo with commands (`/upper`, `/reverse`, `/count`) |
 | `chat` | Multi-tab broadcast chat over WebSocket server push |
-| `websocket-elm` | The chat with an Elm frontend; the compiled bundle is embedded at build time via an ingested import — no runtime file I/O |
+| `websocket-elm` | The chat with an Elm frontend; the compiled bundle is served from disk via `File.read_bytes!` — rebuild Elm, refresh, no server restart |
 
-Tests: `python3 tests/test_ws_concurrent.py` (against `ws-echo`) and
-`python3 tests/test_ws_chat.py` (against `chat`), with a server running.
+Tests (each against a running server): `python3 tests/test_http.py`
+(against `app` — routing, escaping, and every platform effect via
+`/system`, incl. a parallel-request race check), plus the WebSocket
+protocol suites `tests/test_ws_concurrent.py` (against `ws-echo`) and
+`tests/test_ws_chat.py` (against `chat`).
 
 ## How it works (the short version)
 
 ```
 ┌─────────┐  accept   ┌──────────────┐  parse HTTP   ┌─────────────────┐
 │ acceptor │ ───────▶ │ worker pool  │ ────────────▶ │ roc__handle     │
-│ (poll)   │          │ (≤16 threads)│  Roc records  │ (interpreter,   │
-└─────────┘          └──────────────┘ ◀──────────── │  one at a time) │
+│ (poll)   │          │ (≤16 threads)│  Roc records  │ (parallel, one  │
+└─────────┘          └──────────────┘ ◀──────────── │  per worker)    │
                             │            Response    └─────────────────┘
                             ▼
                      WebSocket frames ⇆ roc__ws_message + broadcast registry

@@ -406,6 +406,32 @@ Battery: 100 parallel /system requests, 100 concurrent POST /notes (all
 still green, 0 leaks after hundreds of effectful requests and 200
 subprocess spawns, graceful SIGINT.
 
+## Round 10 (2026-06-10): maintainer feedback — `?` style, mutex removed, realloc tidied
+
+Anton (roc core) reviewed the published repo. Three changes followed:
+
+1. **`?` instead of match pyramids.** The /system roundtrips and seed
+   handling now use happy-path `?` propagation through small `try_*`
+   functions. Lesson learned: `?` early-returns carry the CALLEE's error
+   union, and the vendored File/Dir signatures have CLOSED unions — so a
+   `?` chain must stay within one module's error type (Cmd works across
+   steps because its signatures end in `, ..`). Semantic checks report
+   through the Ok branch.
+
+2. **The roc-call mutex is gone.** It was an interpreter-era relic;
+   compiled artifacts have no shared mutable state. Verified without it:
+   500-request parallel battery incl. File/Dir/Cmd effects, WS suites,
+   0 leaks. 200 effectful requests now take 0.72 s (the per-request 2 ms
+   sleeps used to serialize). Consequences honestly handled: app-level
+   read-modify-write is now genuinely racy (measured 41/100 surviving
+   concurrent /notes appends — documented in the example), and /system
+   probes use unique per-request temp paths.
+
+3. **Realloc copies user data only** (style sync with
+   lukewilliamboswell/roc-platform-template-zig — same size-header scheme,
+   ours previously copied header+data then overwrote the header; equivalent
+   but less clear).
+
 ## Known limitations
 
 - Handler execution is serialized (see above) — parallel I/O, sequential Roc.

@@ -25,8 +25,13 @@ a5a2c00 (websocket-elm).
 ## Architecture (all verified working)
 
 - Handler inversion: Zig host owns listener + accept loop; worker pool
-  (min(2x cores,16)) does connection I/O; roc calls serialized by
-  roc_call_mutex (interpreter shares global state; refcounts ARE atomic).
+  (min(2x cores,16)) does connection I/O. Since 2026-06-10 (maintainer
+  feedback round) roc calls run IN PARALLEL — the old roc_call_mutex was
+  an interpreter-era relic; compiled artifacts have no shared mutable
+  state (verified: 500-req parallel battery, WS suites, 0 leaks).
+  Consequence: app-level file read-modify-write IS racy now (measured:
+  41/100 concurrent /notes appends survived); /system probes use unique
+  per-request paths; durable pattern = one file per record.
 - Apps export BOTH:
   handle! : Request => Response        (HTTP; roc-lang/http vendored types)
   on_ws!  : { message : Str, path : Str } => { broadcast : Str, reply : Str }
@@ -218,7 +223,9 @@ Phase 4 — convergence: consider nightly-based pinning (matches basic-cli),
 
 1. zig build arm64mac (use $ZIG or ~/zig-0.16.0/zig)
 2. roc check + roc test on changed examples
-3. ./build.sh app — curl battery: /, /hello/Jörg (urlencoded), /echo?msg=,
+3. ./build.sh app — python3 tests/test_http.py (codified battery: routing,
+   escaping, all effects via /system, parallel race check). Manual spot
+   checks if preferred: /, /hello/Jörg (urlencoded), /echo?msg=,
    POST /echo, /headers (X-Probe roundtrip), /api/hello (JSON content-type),
    HEAD (no body), OPTIONS (204+Allow), 404, unknown method
 4. seq 1 100 | xargs -P 20 curl (expect 100x200, ~0.2s)

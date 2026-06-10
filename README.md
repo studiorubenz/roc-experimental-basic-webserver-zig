@@ -9,7 +9,7 @@ to Roc's new Zig-based compiler**, with the host written in Zig.
 > is well underway (Rust host); basic-webserver's hasn't publicly started yet.
 > The day it lands, this repo retires. Until then, it's a working data point.
 >
-> Built almost entirely by an AI (Claude — the Fable model), steered by a
+> Built almost entirely by Fable, steered by a
 > human who knows nothing about low-level programming. Judge accordingly. 🙂
 
 ![HTTP demo](docs/demo-app.gif)

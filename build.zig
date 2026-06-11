@@ -47,27 +47,9 @@ const all_targets = [_]RocTarget{
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
-    // Construct the roc builtins module directly from the pinned worktree
-    // instead of via b.dependency: roc's build.zig reads files relative to
-    // the cwd and panics when executed as a dependency. The module graph is
-    // tiny anyway: builtins <- tracy <- build_options (tracy disabled).
-    const roc_path = "../roc-48b28c07";
-
-    const tracy_options = b.addOptions();
-    tracy_options.addOption(bool, "enable_tracy", false);
-    tracy_options.addOption(bool, "enable_tracy_callstack", false);
-    tracy_options.addOption(bool, "enable_tracy_allocation", false);
-    tracy_options.addOption(u32, "tracy_callstack_depth", 0);
-
-    const tracy_module = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = roc_path ++ "/src/build/tracy.zig" },
-    });
-    tracy_module.addOptions("build_options", tracy_options);
-
-    const builtins_module = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = roc_path ++ "/src/builtins/mod.zig" },
-    });
-    builtins_module.addImport("tracy", tracy_module);
+    // The host's ABI types come from platform/roc_platform_abi.zig, generated
+    // by `roc glue` (./glue.sh) and checked in — building needs no compiler
+    // source tree, only Zig.
 
     // Cleanup step
     const cleanup_step = b.step("clean", "Remove all built library files");
@@ -92,7 +74,7 @@ pub fn build(b: *std.Build) void {
         target_step.dependOn(cleanup_step);
 
         const target = b.resolveTargetQuery(roc_target.toZigTarget());
-        const host_lib = buildHostLib(b, target, optimize, builtins_module);
+        const host_lib = buildHostLib(b, target, optimize);
 
         const copy_target = b.addUpdateSourceFiles();
         copy_target.addCopyFileToSource(
@@ -118,7 +100,7 @@ pub fn build(b: *std.Build) void {
         return;
     };
 
-    const native_lib = buildHostLib(b, native_target, optimize, builtins_module);
+    const native_lib = buildHostLib(b, native_target, optimize);
     b.installArtifact(native_lib);
 
     const copy_native = b.addUpdateSourceFiles();
@@ -137,9 +119,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("platform/host.zig"),
             .target = native_target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "builtins", .module = builtins_module },
-            },
             .link_libc = native_target.result.os.tag != .windows and native_target.result.os.tag != .wasi,
         }),
     });
@@ -197,7 +176,6 @@ fn buildHostLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    builtins_module: *std.Build.Module,
 ) *std.Build.Step.Compile {
     const host_lib = b.addLibrary(.{
         .name = "host",
@@ -208,9 +186,6 @@ fn buildHostLib(
             .optimize = optimize,
             .strip = optimize != .Debug,
             .pic = true,
-            .imports = &.{
-                .{ .name = "builtins", .module = builtins_module },
-            },
             .link_libc = target.result.os.tag != .windows and target.result.os.tag != .wasi,
         }),
     });

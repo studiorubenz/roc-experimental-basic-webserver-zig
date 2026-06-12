@@ -1758,6 +1758,16 @@ fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
     shutting_down.store(true, .release);
 }
 
+/// SIGPIPE: raised when writing to a socket whose peer is gone (e.g. the
+/// browser reloaded mid-broadcast); the default action would kill the whole
+/// server without a message. With the signal caught, the write just fails
+/// with EPIPE, which writeAllFd tolerates, and the connection's read loop
+/// then notices the close. A no-op handler rather than SIG_IGN on purpose:
+/// an ignored disposition survives exec and would leak into processes
+/// spawned via Cmd, breaking ordinary pipe semantics there, while a caught
+/// handler is reset to the default in the child automatically.
+fn handleSigpipe(_: std.posix.SIG) callconv(.c) void {}
+
 fn installShutdownHandlers() void {
     const action = std.posix.Sigaction{
         .handler = .{ .handler = handleShutdownSignal },
@@ -1766,6 +1776,13 @@ fn installShutdownHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+
+    const pipe_action = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigpipe },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.PIPE, &pipe_action, null);
 }
 
 /// Port precedence: argv[1], then PORT env var, then 8000.

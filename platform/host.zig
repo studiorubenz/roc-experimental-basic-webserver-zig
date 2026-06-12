@@ -3,7 +3,15 @@
 //! Handler-inversion architecture: the host owns the TCP listener and the
 //! accept loop. For every incoming request it parses method/path/body,
 //! builds a Roc record, and calls the app's exported handler
-//! (`roc__handle : Request => Response`), then writes the response.
+//! (`roc_handle : Request => Response`), then writes the response.
+//!
+//! Symbol ABI (roc-lang/roc#9613): hosted functions are plain C-ABI
+//! symbols — arguments by value, return by value, no RocOps parameter —
+//! exported under the names declared in main.roc's `hosted` section.
+//! The host also exports the six fixed runtime symbols (roc_alloc,
+//! roc_dealloc, roc_realloc, roc_dbg, roc_expect_failed, roc_crashed).
+//! Roc-compiled code resolves all of them at link time, so unused host
+//! code is dead-code-eliminated from the final binary.
 //!
 //! Concurrency model: a pool of worker threads handles connections in
 //! parallel, and calls into compiled Roc code run in parallel too — the
@@ -111,7 +119,7 @@ comptime {
 }
 
 // ============================================================================
-// RocOps callbacks
+// Runtime symbols (roc_alloc & friends) and RocOps
 // ============================================================================
 
 // Allocations carry a size header so that realloc knows how many bytes to
@@ -123,11 +131,15 @@ fn headerSize(alignment: usize) usize {
     return @max(alignment, @alignOf(usize));
 }
 
-fn rocAllocFn(roc_alloc: *abi.RocAlloc, env: *anyopaque) callconv(.c) void {
-    _ = env;
-    const align_enum = std.mem.Alignment.fromByteUnits(@max(roc_alloc.alignment, @alignOf(usize)));
-    const header = headerSize(roc_alloc.alignment);
-    const total_size = roc_alloc.length + header;
+// The six fixed runtime symbols every symbol-ABI host exports. Roc-compiled
+// code calls these directly; the host's own RocOps callbacks below delegate
+// to them too, so both paths share one implementation. All of them are
+// thread-safe (c_allocator + raw fd writes), as workers call Roc in parallel.
+
+fn hostAlloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+    const align_enum = std.mem.Alignment.fromByteUnits(@max(alignment, @alignOf(usize)));
+    const header = headerSize(alignment);
+    const total_size = length + header;
 
     const base_ptr = c_allocator.rawAlloc(total_size, align_enum, @returnAddress()) orelse {
         printStderr("Host error: allocation failed, out of memory\n");
@@ -136,29 +148,27 @@ fn rocAllocFn(roc_alloc: *abi.RocAlloc, env: *anyopaque) callconv(.c) void {
 
     const size_ptr: *usize = @ptrFromInt(@intFromPtr(base_ptr) + header - @sizeOf(usize));
     size_ptr.* = total_size;
-    roc_alloc.answer = @ptrFromInt(@intFromPtr(base_ptr) + header);
+    return @ptrFromInt(@intFromPtr(base_ptr) + header);
 }
 
-fn rocDeallocFn(roc_dealloc: *abi.RocDealloc, env: *anyopaque) callconv(.c) void {
-    _ = env;
-    const align_enum = std.mem.Alignment.fromByteUnits(@max(roc_dealloc.alignment, @alignOf(usize)));
-    const header = headerSize(roc_dealloc.alignment);
-    const size_ptr: *const usize = @ptrFromInt(@intFromPtr(roc_dealloc.ptr) - @sizeOf(usize));
+fn hostDealloc(ptr: *anyopaque, alignment: usize) callconv(.c) void {
+    const align_enum = std.mem.Alignment.fromByteUnits(@max(alignment, @alignOf(usize)));
+    const header = headerSize(alignment);
+    const size_ptr: *const usize = @ptrFromInt(@intFromPtr(ptr) - @sizeOf(usize));
     const total_size = size_ptr.*;
-    const base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(roc_dealloc.ptr) - header);
+    const base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(ptr) - header);
     c_allocator.rawFree(base_ptr[0..total_size], align_enum, @returnAddress());
 }
 
-fn rocReallocFn(roc_realloc: *abi.RocRealloc, env: *anyopaque) callconv(.c) void {
-    _ = env;
-    const align_enum = std.mem.Alignment.fromByteUnits(@max(roc_realloc.alignment, @alignOf(usize)));
-    const header = headerSize(roc_realloc.alignment);
+fn hostRealloc(ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+    const align_enum = std.mem.Alignment.fromByteUnits(@max(alignment, @alignOf(usize)));
+    const header = headerSize(alignment);
 
-    const old_size_ptr: *const usize = @ptrFromInt(@intFromPtr(roc_realloc.answer) - @sizeOf(usize));
+    const old_size_ptr: *const usize = @ptrFromInt(@intFromPtr(ptr) - @sizeOf(usize));
     const old_total_size = old_size_ptr.*;
-    const old_base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(roc_realloc.answer) - header);
+    const old_base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(ptr) - header);
 
-    const new_total_size = roc_realloc.new_length + header;
+    const new_total_size = new_length + header;
     const new_base_ptr = c_allocator.rawAlloc(new_total_size, align_enum, @returnAddress()) orelse {
         printStderr("Host error: reallocation failed, out of memory\n");
         std.process.exit(1);
@@ -167,47 +177,97 @@ fn rocReallocFn(roc_realloc: *abi.RocRealloc, env: *anyopaque) callconv(.c) void
     // Copy the user data only (the header is rewritten below); matches
     // lukewilliamboswell/roc-platform-template-zig.
     const old_user_size = old_total_size - header;
-    const copy_size = @min(old_user_size, roc_realloc.new_length);
+    const copy_size = @min(old_user_size, new_length);
     const new_user_ptr: [*]u8 = @ptrFromInt(@intFromPtr(new_base_ptr) + header);
-    const old_user_ptr: [*]const u8 = @ptrCast(roc_realloc.answer);
+    const old_user_ptr: [*]const u8 = @ptrCast(ptr);
     @memcpy(new_user_ptr[0..copy_size], old_user_ptr[0..copy_size]);
     c_allocator.rawFree(old_base_ptr[0..old_total_size], align_enum, @returnAddress());
 
     const new_size_ptr: *usize = @ptrFromInt(@intFromPtr(new_base_ptr) + header - @sizeOf(usize));
     new_size_ptr.* = new_total_size;
-    roc_realloc.answer = @ptrFromInt(@intFromPtr(new_base_ptr) + header);
+    return @ptrFromInt(@intFromPtr(new_base_ptr) + header);
 }
 
-fn rocDbgFn(roc_dbg: *const abi.RocDbg, env: *anyopaque) callconv(.c) void {
-    _ = env;
+fn hostDbg(bytes: [*]const u8, len: usize) callconv(.c) void {
     printStderr("dbg: ");
-    printStderr(roc_dbg.utf8_bytes[0..roc_dbg.len]);
+    printStderr(bytes[0..len]);
     printStderr("\n");
 }
 
-fn rocExpectFailedFn(roc_expect: *const abi.RocExpectFailed, env: *anyopaque) callconv(.c) void {
-    _ = env;
-    const source_bytes = roc_expect.utf8_bytes[0..roc_expect.len];
-    const trimmed = std.mem.trim(u8, source_bytes, " \t\n\r");
+fn hostExpectFailed(bytes: [*]const u8, len: usize) callconv(.c) void {
+    const trimmed = std.mem.trim(u8, bytes[0..len], " \t\n\r");
     printStderr("expect failed: ");
     printStderr(trimmed);
     printStderr("\n");
 }
 
-fn rocCrashedFn(roc_crashed: *const abi.RocCrashed, env: *anyopaque) callconv(.c) noreturn {
-    _ = env;
+fn hostCrashed(bytes: [*]const u8, len: usize) callconv(.c) void {
     printStderr("\nRoc crashed: ");
-    printStderr(roc_crashed.utf8_bytes[0..roc_crashed.len]);
+    printStderr(bytes[0..len]);
     printStderr("\n");
     std.process.exit(1);
+}
+
+// RocOps callbacks: the struct itself no longer crosses the host boundary,
+// but the generated RocStr/RocList helpers still allocate through one.
+
+fn rocAllocFn(_: *RocOps, length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+    return hostAlloc(length, alignment);
+}
+
+fn rocDeallocFn(_: *RocOps, ptr: *anyopaque, alignment: usize) callconv(.c) void {
+    hostDealloc(ptr, alignment);
+}
+
+fn rocReallocFn(_: *RocOps, ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+    return hostRealloc(ptr, new_length, alignment);
+}
+
+fn rocDbgFn(_: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
+    hostDbg(bytes, len);
+}
+
+fn rocExpectFailedFn(_: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
+    hostExpectFailed(bytes, len);
+}
+
+fn rocCrashedFn(_: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
+    hostCrashed(bytes, len);
+}
+
+/// The host's RocOps, used by hosted functions and the request plumbing for
+/// the generated RocStr / RocList helpers (allocation, decref). Hosted
+/// functions no longer receive a *RocOps argument under the symbol ABI, so
+/// they reach it through this file-level instance. The callbacks are
+/// stateless and thread-safe, so one global shared by all workers suffices.
+var g_env: u8 = 0;
+var g_roc_ops = RocOps{
+    .env = @ptrCast(&g_env),
+    .roc_alloc = rocAllocFn,
+    .roc_dealloc = rocDeallocFn,
+    .roc_realloc = rocReallocFn,
+    .roc_dbg = rocDbgFn,
+    .roc_expect_failed = rocExpectFailedFn,
+    .roc_crashed = rocCrashedFn,
+    .hosted_fns = .{ .count = 0, .fns = undefined },
+};
+
+/// A hosted function's return slot of exactly `size` bytes: the Roc tag-union
+/// layouts documented at each hosted function, returned by value with the
+/// natural C ABI (all current shapes are > 16 bytes, so they return via sret
+/// on both x86-64 and aarch64 — the caller passes a result buffer of exactly
+/// this size).
+fn HostedRet(comptime size: usize) type {
+    return extern struct { bytes: [size]u8 align(8) };
 }
 
 // ============================================================================
 // Hosted functions
 // ============================================================================
 
-// Per the host ABI at 48b28c07: Roc transfers ownership of refcounted
-// arguments to hosted functions, which must decref them when done.
+// Per the host ABI: Roc transfers ownership of refcounted arguments to
+// hosted functions, which must decref them when done (unchanged under the
+// symbol ABI).
 
 // --- Env / Utc / Sleep / Random (Phase 1; APIs vendored from basic-cli) ----
 //
@@ -222,8 +282,10 @@ extern "c" fn arc4random_buf(buf: *anyopaque, nbytes: usize) void;
 
 /// Env.cwd! : {} => Try(Str, [CwdUnavailable])
 /// 32 bytes: payload Str@0, disc u8@24 (Err=0, Ok=1).
-fn hostedEnvCwd(ops: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.c) void {
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedEnvCwd() callconv(.c) HostedRet(32) {
+    const ops = &g_roc_ops;
+    var ret: HostedRet(32) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..32], 0);
     var buf: [4096]u8 = undefined;
     if (getcwd(&buf, buf.len)) |path| {
@@ -231,12 +293,15 @@ fn hostedEnvCwd(ops: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.c) v
         str_ptr.* = RocStr.fromSlice(std.mem.span(path), ops);
         out[24] = 1; // Ok
     } // else: zeroed payload + disc 0 = Err(CwdUnavailable)
+    return ret;
 }
 
 /// Env.exe_path! : {} => Try(Str, [ExePathUnavailable])
 /// Same 32-byte shape as cwd!.
-fn hostedEnvExePath(ops: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.c) void {
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedEnvExePath() callconv(.c) HostedRet(32) {
+    const ops = &g_roc_ops;
+    var ret: HostedRet(32) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..32], 0);
     var buf: [4096]u8 = undefined;
     var size: u32 = buf.len;
@@ -245,16 +310,19 @@ fn hostedEnvExePath(ops: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.
         str_ptr.* = RocStr.fromSlice(std.mem.span(@as([*:0]u8, @ptrCast(&buf))), ops);
         out[24] = 1; // Ok
     }
+    return ret;
 }
 
 /// Env.var! : Str => Try(Str, [VarNotFound(Str)])
 /// 32 bytes: payload Str@0 (value on Ok, the queried name on Err), disc u8@24.
-fn hostedEnvVar(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.EnvVarArgs) callconv(.c) void {
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedEnvVar(name_str: RocStr) callconv(.c) HostedRet(32) {
+    const ops = &g_roc_ops;
+    var ret: HostedRet(32) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..32], 0);
     const str_ptr: *align(1) RocStr = @ptrCast(out);
 
-    const name = args.arg0.asSlice();
+    const name = name_str.asSlice();
     var name_z: [1024]u8 = undefined;
     if (name.len < name_z.len) {
         @memcpy(name_z[0..name.len], name);
@@ -262,14 +330,15 @@ fn hostedEnvVar(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.EnvVarArgs) 
         if (getenv(@ptrCast(&name_z))) |value| {
             str_ptr.* = RocStr.fromSlice(std.mem.span(value), ops);
             out[24] = 1; // Ok
-            args.arg0.decref(ops);
-            return;
+            name_str.decref(ops);
+            return ret;
         }
     }
     // Err(VarNotFound(name)): the argument string moves into the error
     // payload, transferring ownership — no decref.
-    str_ptr.* = args.arg0;
+    str_ptr.* = name_str;
     out[24] = 0; // Err
+    return ret;
 }
 
 // --- Cmd (Phase 3) ----------------------------------------------------------
@@ -341,20 +410,31 @@ fn waitForChild(pid: std.c.pid_t) WaitResult {
 /// Cmd.host_exec_exit_code! : Cmd => Try(I32, IOErr)
 /// 40 bytes: payload@0 (I32 or IOErr), Try disc u8@32. The child inherits
 /// stdin/stdout/stderr.
-fn hostedCmdHostExecExitCode(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.Cmd) callconv(.c) void {
-    defer decrefCmd(args, ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedCmdHostExecExitCode(cmd: abi.Cmd) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer decrefCmd(&cmd, ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
 
     var arena_state = std.heap.ArenaAllocator.init(c_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const argv = buildArgv(arena, args) catch return writeFileErr(out, @intFromEnum(std.c.E.NOMEM), ops);
-    const envp = buildEnvp(arena, args) catch return writeFileErr(out, @intFromEnum(std.c.E.NOMEM), ops);
+    const argv = buildArgv(arena, &cmd) catch {
+        writeFileErr(out, @intFromEnum(std.c.E.NOMEM), ops);
+        return ret;
+    };
+    const envp = buildEnvp(arena, &cmd) catch {
+        writeFileErr(out, @intFromEnum(std.c.E.NOMEM), ops);
+        return ret;
+    };
 
     var pid: std.c.pid_t = undefined;
     const rc = std.c.posix_spawnp(&pid, argv[0].?, null, null, @ptrCast(argv), @ptrCast(envp));
-    if (rc != 0) return writeFileErr(out, rc, ops); // posix_spawn returns the errno
+    if (rc != 0) {
+        writeFileErr(out, rc, ops); // posix_spawn returns the errno
+        return ret;
+    }
 
     switch (waitForChild(pid)) {
         .exited => |code| {
@@ -370,6 +450,7 @@ fn hostedCmdHostExecExitCode(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi
         },
         .err => |errnum| writeFileErr(out, errnum, ops),
     }
+    return ret;
 }
 
 /// Cmd.host_exec_output! : Cmd =>
@@ -378,9 +459,11 @@ fn hostedCmdHostExecExitCode(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi
 /// Outer: payload@0 = max(48, inner 64) = 64, outer disc u8@64, total 72.
 /// Inner: payload@0 = max(failure 56, IOErr 32) = 56, inner disc u8@56.
 /// Failure record: stderr_bytes@0, stdout_bytes@24, exit_code i32@48.
-fn hostedCmdHostExecOutput(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.Cmd) callconv(.c) void {
-    defer decrefCmd(args, ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedCmdHostExecOutput(cmd: abi.Cmd) callconv(.c) HostedRet(72) {
+    const ops = &g_roc_ops;
+    defer decrefCmd(&cmd, ops);
+    var ret: HostedRet(72) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..72], 0);
 
     var arena_state = std.heap.ArenaAllocator.init(c_allocator);
@@ -393,16 +476,26 @@ fn hostedCmdHostExecOutput(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.C
             o[64] = 0; // outer Try: Err
         }
     }.write;
-    const argv = buildArgv(arena, args) catch return spawn_err(out, @intFromEnum(std.c.E.NOMEM), ops);
-    const envp = buildEnvp(arena, args) catch return spawn_err(out, @intFromEnum(std.c.E.NOMEM), ops);
+    const argv = buildArgv(arena, &cmd) catch {
+        spawn_err(out, @intFromEnum(std.c.E.NOMEM), ops);
+        return ret;
+    };
+    const envp = buildEnvp(arena, &cmd) catch {
+        spawn_err(out, @intFromEnum(std.c.E.NOMEM), ops);
+        return ret;
+    };
 
     var stdout_pipe: [2]Fd = undefined;
     var stderr_pipe: [2]Fd = undefined;
-    if (std.c.pipe(&stdout_pipe) != 0) return spawn_err(out, std.c._errno().*, ops);
+    if (std.c.pipe(&stdout_pipe) != 0) {
+        spawn_err(out, std.c._errno().*, ops);
+        return ret;
+    }
     if (std.c.pipe(&stderr_pipe) != 0) {
         _ = std.c.close(stdout_pipe[0]);
         _ = std.c.close(stdout_pipe[1]);
-        return spawn_err(out, std.c._errno().*, ops);
+        spawn_err(out, std.c._errno().*, ops);
+        return ret;
     }
 
     var actions: std.c.posix_spawn_file_actions_t = undefined;
@@ -420,7 +513,8 @@ fn hostedCmdHostExecOutput(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.C
     if (rc != 0) {
         _ = std.c.close(stdout_pipe[0]);
         _ = std.c.close(stderr_pipe[0]);
-        return spawn_err(out, rc, ops);
+        spawn_err(out, rc, ops);
+        return ret;
     }
 
     // Drain both pipes until EOF (poll prevents a deadlock when the child
@@ -480,6 +574,7 @@ fn hostedCmdHostExecOutput(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.C
         },
         .err => |errnum| spawn_err(out, errnum, ops),
     }
+    return ret;
 }
 
 // --- Dir (Phase 3) ----------------------------------------------------------
@@ -489,25 +584,39 @@ fn hostedCmdHostExecOutput(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.C
 extern "c" fn closedir(dir: *std.c.DIR) c_int;
 
 /// Dir.create! : Str => Try({}, [DirErr(IOErr)])
-fn hostedDirCreate(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirCreateArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedDirCreate(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     var buf: [1024]u8 = undefined;
-    const p = pathZ(args.arg0, &buf) orelse return writeFileErr(out, ENAMETOOLONG, ops);
-    if (std.c.mkdir(p, 0o755) != 0) return writeFileErr(out, std.c._errno().*, ops);
+    const p = pathZ(path_str, &buf) orelse {
+        writeFileErr(out, ENAMETOOLONG, ops);
+        return ret;
+    };
+    if (std.c.mkdir(p, 0o755) != 0) {
+        writeFileErr(out, std.c._errno().*, ops);
+        return ret;
+    }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// Dir.create_all! : Str => Try({}, [DirErr(IOErr)])
 /// mkdir every prefix, ignoring EEXIST (an existing directory is success).
-fn hostedDirCreateAll(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirCreate_allArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedDirCreateAll(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
-    const path = args.arg0.asSlice();
+    const path = path_str.asSlice();
     var buf: [1024]u8 = undefined;
-    if (path.len >= buf.len) return writeFileErr(out, ENAMETOOLONG, ops);
+    if (path.len >= buf.len) {
+        writeFileErr(out, ENAMETOOLONG, ops);
+        return ret;
+    }
     var i: usize = 1; // a leading '/' is not a directory to create
     while (i <= path.len) : (i += 1) {
         if (i == path.len or path[i] == '/') {
@@ -515,11 +624,15 @@ fn hostedDirCreateAll(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirCre
             buf[i] = 0;
             if (std.c.mkdir(@ptrCast(&buf), 0o755) != 0) {
                 const errnum = std.c._errno().*;
-                if (errnum != @intFromEnum(std.c.E.EXIST)) return writeFileErr(out, errnum, ops);
+                if (errnum != @intFromEnum(std.c.E.EXIST)) {
+                    writeFileErr(out, errnum, ops);
+                    return ret;
+                }
             }
         }
     }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// Recursively delete a directory tree. Returns 0 or an errno.
@@ -550,37 +663,63 @@ fn deleteTree(path: [*:0]const u8) c_int {
 }
 
 /// Dir.delete_all! : Str => Try({}, [DirErr(IOErr)])
-fn hostedDirDeleteAll(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirDelete_allArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedDirDeleteAll(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     var buf: [1024]u8 = undefined;
-    const p = pathZ(args.arg0, &buf) orelse return writeFileErr(out, ENAMETOOLONG, ops);
+    const p = pathZ(path_str, &buf) orelse {
+        writeFileErr(out, ENAMETOOLONG, ops);
+        return ret;
+    };
     const errnum = deleteTree(p);
-    if (errnum != 0) return writeFileErr(out, errnum, ops);
+    if (errnum != 0) {
+        writeFileErr(out, errnum, ops);
+        return ret;
+    }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// Dir.delete_empty! : Str => Try({}, [DirErr(IOErr)])
-fn hostedDirDeleteEmpty(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirDelete_emptyArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedDirDeleteEmpty(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     var buf: [1024]u8 = undefined;
-    const p = pathZ(args.arg0, &buf) orelse return writeFileErr(out, ENAMETOOLONG, ops);
-    if (std.c.rmdir(p) != 0) return writeFileErr(out, std.c._errno().*, ops);
+    const p = pathZ(path_str, &buf) orelse {
+        writeFileErr(out, ENAMETOOLONG, ops);
+        return ret;
+    };
+    if (std.c.rmdir(p) != 0) {
+        writeFileErr(out, std.c._errno().*, ops);
+        return ret;
+    }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// Dir.list! : Str => Try(List(Str), [DirErr(IOErr)])
 /// Returns "dir/name" paths, like basic-cli (which returns prefixed paths).
-fn hostedDirList(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirListArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedDirList(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     var buf: [1024]u8 = undefined;
-    const p = pathZ(args.arg0, &buf) orelse return writeFileErr(out, ENAMETOOLONG, ops);
-    const dir = std.c.opendir(p) orelse return writeFileErr(out, std.c._errno().*, ops);
+    const p = pathZ(path_str, &buf) orelse {
+        writeFileErr(out, ENAMETOOLONG, ops);
+        return ret;
+    };
+    const dir = std.c.opendir(p) orelse {
+        writeFileErr(out, std.c._errno().*, ops);
+        return ret;
+    };
     defer _ = closedir(dir);
 
     var paths: std.ArrayList(RocStr) = .empty;
@@ -589,7 +728,7 @@ fn hostedDirList(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirListArgs
         const name = entry.name[0..entry.namlen];
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         var child_buf: [1024]u8 = undefined;
-        const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ args.arg0.asSlice(), name }) catch continue;
+        const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ path_str.asSlice(), name }) catch continue;
         paths.append(c_allocator, RocStr.fromSlice(child, ops)) catch break;
     }
 
@@ -600,10 +739,11 @@ fn hostedDirList(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.DirListArgs
         // RocStrList reserves the refcounted-elements header (the elements
         // are RocStrs).
         const list = RocStrList.allocate(paths.items.len, ops);
-        for (paths.items, 0..) |path_str, i| list.elements_ptr.?[i] = path_str;
+        for (paths.items, 0..) |path_roc_str, i| list.elements_ptr.?[i] = path_roc_str;
         list_ptr.* = list;
     }
     out[32] = 1; // Ok
+    return ret;
 }
 
 // --- File (Phase 2) --------------------------------------------------------
@@ -713,22 +853,33 @@ fn writeWholeFile(path: RocStr, bytes: []const u8) c_int {
 }
 
 /// File.delete! : Str => Try({}, [FileErr(IOErr)])
-fn hostedFileDelete(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileDeleteArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedFileDelete(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     var buf: [1024]u8 = undefined;
-    const p = pathZ(args.arg0, &buf) orelse return writeFileErr(out, ENAMETOOLONG, ops);
-    if (unlink(p) != 0) return writeFileErr(out, std.c._errno().*, ops);
+    const p = pathZ(path_str, &buf) orelse {
+        writeFileErr(out, ENAMETOOLONG, ops);
+        return ret;
+    };
+    if (unlink(p) != 0) {
+        writeFileErr(out, std.c._errno().*, ops);
+        return ret;
+    }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// File.read_bytes! : Str => Try(List(U8), [FileErr(IOErr)])
-fn hostedFileReadBytes(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileRead_bytesArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedFileReadBytes(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
-    switch (readWholeFile(args.arg0)) {
+    switch (readWholeFile(path_str)) {
         .err => |errnum| writeFileErr(out, errnum, ops),
         .ok => |data| {
             var list = data;
@@ -738,6 +889,7 @@ fn hostedFileReadBytes(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileR
             out[32] = 1; // Ok
         },
     }
+    return ret;
 }
 
 /// Convert bytes that failed UTF-8 validation into a RocStr, replacing each
@@ -818,11 +970,13 @@ test "utf8LossyToRocStr matches the builtin's replacement granularity" {
 
 /// File.read_utf8! : Str => Try(Str, [FileErr(IOErr)])
 /// Invalid UTF-8 is replaced with U+FFFD.
-fn hostedFileReadUtf8(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileRead_utf8Args) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedFileReadUtf8(path_str: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
-    switch (readWholeFile(args.arg0)) {
+    switch (readWholeFile(path_str)) {
         .err => |errnum| writeFileErr(out, errnum, ops),
         .ok => |data| {
             var list = data;
@@ -836,116 +990,140 @@ fn hostedFileReadUtf8(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileRe
             out[32] = 1; // Ok
         },
     }
+    return ret;
 }
 
 /// File.write_bytes! : Str, List(U8) => Try({}, [FileErr(IOErr)])
-fn hostedFileWriteBytes(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileWrite_bytesArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    defer args.arg1.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedFileWriteBytes(path_str: RocStr, bytes: RocBytes) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    defer bytes.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
-    const errnum = writeWholeFile(args.arg0, args.arg1.items());
-    if (errnum != 0) return writeFileErr(out, errnum, ops);
+    const errnum = writeWholeFile(path_str, bytes.items());
+    if (errnum != 0) {
+        writeFileErr(out, errnum, ops);
+        return ret;
+    }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// File.write_utf8! : Str, Str => Try({}, [FileErr(IOErr)])
-fn hostedFileWriteUtf8(ops: *RocOps, ret_ptr: *anyopaque, args: *const abi.FileWrite_utf8Args) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    defer args.arg1.decref(ops);
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedFileWriteUtf8(path_str: RocStr, content: RocStr) callconv(.c) HostedRet(40) {
+    const ops = &g_roc_ops;
+    defer path_str.decref(ops);
+    defer content.decref(ops);
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
-    const errnum = writeWholeFile(args.arg0, args.arg1.asSlice());
-    if (errnum != 0) return writeFileErr(out, errnum, ops);
+    const errnum = writeWholeFile(path_str, content.asSlice());
+    if (errnum != 0) {
+        writeFileErr(out, errnum, ops);
+        return ret;
+    }
     out[32] = 1; // Ok({})
+    return ret;
 }
 
 /// Random.seed_u32! : {} => Try(U32, [RandomErr(IOErr)])
 /// 40 bytes: payload@0 = max(U32, IOErr 32) = 32, Try disc u8@32.
 /// arc4random never fails, so this always returns Ok.
-fn hostedRandomSeedU32(_: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.c) void {
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedRandomSeedU32() callconv(.c) HostedRet(40) {
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     arc4random_buf(out, 4);
     out[32] = 1; // Ok
+    return ret;
 }
 
 /// Random.seed_u64! : {} => Try(U64, [RandomErr(IOErr)])
 /// Same 40-byte shape, U64 payload.
-fn hostedRandomSeedU64(_: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.c) void {
-    const out: [*]u8 = @ptrCast(ret_ptr);
+fn hostedRandomSeedU64() callconv(.c) HostedRet(40) {
+    var ret: HostedRet(40) = undefined;
+    const out: [*]u8 = &ret.bytes;
     @memset(out[0..40], 0);
     arc4random_buf(out, 8);
     out[32] = 1; // Ok
+    return ret;
 }
 
 /// Sleep.millis! : U64 => {}
 /// A sleeping handler occupies its worker thread for the duration; with
 /// every worker sleeping, further connections queue. Documented in Sleep.roc.
-fn hostedSleepMillis(_: *RocOps, _: *anyopaque, args: *const abi.SleepMillisArgs) callconv(.c) void {
+fn hostedSleepMillis(millis: u64) callconv(.c) void {
     var req: std.c.timespec = .{
-        .sec = @intCast(args.arg0 / 1000),
-        .nsec = @intCast((args.arg0 % 1000) * 1_000_000),
+        .sec = @intCast(millis / 1000),
+        .nsec = @intCast((millis % 1000) * 1_000_000),
     };
     // Retry on signal interrupt; rem is updated with the remaining time.
     while (std.c.nanosleep(&req, &req) != 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) {}
 }
 
 /// Utc.now! : {} => U128 (nanoseconds since the Unix epoch)
-fn hostedUtcNow(_: *RocOps, ret_ptr: *anyopaque, _: *anyopaque) callconv(.c) void {
-    const out: *align(1) u128 = @ptrCast(ret_ptr);
+fn hostedUtcNow() callconv(.c) u128 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.REALTIME, &ts) != 0) {
-        out.* = 0;
-        return;
+        return 0;
     }
-    out.* = @as(u128, @intCast(ts.sec)) * 1_000_000_000 + @as(u128, @intCast(ts.nsec));
+    return @as(u128, @intCast(ts.sec)) * 1_000_000_000 + @as(u128, @intCast(ts.nsec));
 }
 
 /// Stderr.line! : Str => {}
-fn hostedStderrLine(ops: *RocOps, _: *anyopaque, args: *const abi.StderrLineArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    printStderr(args.arg0.asSlice());
+fn hostedStderrLine(msg: RocStr) callconv(.c) void {
+    defer msg.decref(&g_roc_ops);
+    printStderr(msg.asSlice());
     printStderr("\n");
 }
 
 /// Stdout.line! : Str => {}
-fn hostedStdoutLine(ops: *RocOps, _: *anyopaque, args: *const abi.StdoutLineArgs) callconv(.c) void {
-    defer args.arg0.decref(ops);
-    printStdout(args.arg0.asSlice());
+fn hostedStdoutLine(msg: RocStr) callconv(.c) void {
+    defer msg.decref(&g_roc_ops);
+    printStdout(msg.asSlice());
     printStdout("\n");
 }
 
-/// Dispatch table built by the generated hostedFunctions(): entries are
-/// ordered alphabetically by fully-qualified hosted name, matching the
-/// indices the compiler assigns during canonicalization, so the order can
-/// no longer drift from the compiler. The @ptrCasts adapt our *anyopaque
-/// return-slot pointers: the glue spec types every fallible return as one
-/// `abi.Try`, but the actual layouts differ per function (see the byte
-/// offsets documented at each hosted function).
-const hosted_fns = abi.hostedFunctions(.{
-    .cmd_host_exec_exit_code = @ptrCast(&hostedCmdHostExecExitCode),
-    .cmd_host_exec_output = @ptrCast(&hostedCmdHostExecOutput),
-    .dir_create = @ptrCast(&hostedDirCreate),
-    .dir_create_all = @ptrCast(&hostedDirCreateAll),
-    .dir_delete_all = @ptrCast(&hostedDirDeleteAll),
-    .dir_delete_empty = @ptrCast(&hostedDirDeleteEmpty),
-    .dir_list = @ptrCast(&hostedDirList),
-    .env_cwd = @ptrCast(&hostedEnvCwd),
-    .env_exe_path = @ptrCast(&hostedEnvExePath),
-    .env_var = @ptrCast(&hostedEnvVar),
-    .file_delete = @ptrCast(&hostedFileDelete),
-    .file_read_bytes = @ptrCast(&hostedFileReadBytes),
-    .file_read_utf8 = @ptrCast(&hostedFileReadUtf8),
-    .file_write_bytes = @ptrCast(&hostedFileWriteBytes),
-    .file_write_utf8 = @ptrCast(&hostedFileWriteUtf8),
-    .random_seed_u32 = @ptrCast(&hostedRandomSeedU32),
-    .random_seed_u64 = @ptrCast(&hostedRandomSeedU64),
-    .sleep_millis = &hostedSleepMillis,
-    .stderr_line = &hostedStderrLine,
-    .stdout_line = &hostedStdoutLine,
-    .utc_now = @ptrCast(&hostedUtcNow),
-});
+// ============================================================================
+// Symbol exports
+// ============================================================================
+
+// The hosted functions, exported under the symbol names declared in
+// main.roc's `hosted` section, plus the six fixed runtime symbols. Hidden
+// visibility keeps them out of the final binary's dynamic symbol table.
+comptime {
+    if (!@import("builtin").is_test) {
+        @export(&hostedCmdHostExecExitCode, .{ .name = "roc_cmd_host_exec_exit_code", .visibility = .hidden });
+        @export(&hostedCmdHostExecOutput, .{ .name = "roc_cmd_host_exec_output", .visibility = .hidden });
+        @export(&hostedDirCreate, .{ .name = "roc_dir_create", .visibility = .hidden });
+        @export(&hostedDirCreateAll, .{ .name = "roc_dir_create_all", .visibility = .hidden });
+        @export(&hostedDirDeleteAll, .{ .name = "roc_dir_delete_all", .visibility = .hidden });
+        @export(&hostedDirDeleteEmpty, .{ .name = "roc_dir_delete_empty", .visibility = .hidden });
+        @export(&hostedDirList, .{ .name = "roc_dir_list", .visibility = .hidden });
+        @export(&hostedEnvCwd, .{ .name = "roc_env_cwd", .visibility = .hidden });
+        @export(&hostedEnvExePath, .{ .name = "roc_env_exe_path", .visibility = .hidden });
+        @export(&hostedEnvVar, .{ .name = "roc_env_var", .visibility = .hidden });
+        @export(&hostedFileDelete, .{ .name = "roc_file_delete", .visibility = .hidden });
+        @export(&hostedFileReadBytes, .{ .name = "roc_file_read_bytes", .visibility = .hidden });
+        @export(&hostedFileReadUtf8, .{ .name = "roc_file_read_utf8", .visibility = .hidden });
+        @export(&hostedFileWriteBytes, .{ .name = "roc_file_write_bytes", .visibility = .hidden });
+        @export(&hostedFileWriteUtf8, .{ .name = "roc_file_write_utf8", .visibility = .hidden });
+        @export(&hostedRandomSeedU32, .{ .name = "roc_random_seed_u32", .visibility = .hidden });
+        @export(&hostedRandomSeedU64, .{ .name = "roc_random_seed_u64", .visibility = .hidden });
+        @export(&hostedSleepMillis, .{ .name = "roc_sleep_millis", .visibility = .hidden });
+        @export(&hostedStderrLine, .{ .name = "roc_stderr_line", .visibility = .hidden });
+        @export(&hostedStdoutLine, .{ .name = "roc_stdout_line", .visibility = .hidden });
+        @export(&hostedUtcNow, .{ .name = "roc_utc_now", .visibility = .hidden });
+
+        @export(&hostAlloc, .{ .name = "roc_alloc", .visibility = .hidden });
+        @export(&hostDealloc, .{ .name = "roc_dealloc", .visibility = .hidden });
+        @export(&hostRealloc, .{ .name = "roc_realloc", .visibility = .hidden });
+        @export(&hostDbg, .{ .name = "roc_dbg", .visibility = .hidden });
+        @export(&hostExpectFailed, .{ .name = "roc_expect_failed", .visibility = .hidden });
+        @export(&hostCrashed, .{ .name = "roc_crashed", .visibility = .hidden });
+    }
+}
 
 // ============================================================================
 // HTTP server
@@ -1049,7 +1227,7 @@ const STATIC_413 = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConne
 // ============================================================================
 //
 // The host owns handshake and framing; for every complete text frame it
-// calls roc__ws_message with { message, path } and sends the returned Str
+// calls roc_ws_message with { message, path } and sends the returned Str
 // back as a text frame. Limitations (fine for a demo): no fragmented
 // messages, text frames only, 64 KiB max payload.
 
@@ -1061,20 +1239,22 @@ const WS_MAX_PAYLOAD: usize = 64 * 1024;
 /// Also bounds graceful-shutdown drain for idle WS connections.
 const WS_IDLE_TIMEOUT_SECONDS: i64 = 5;
 
-/// WebSocket message record passed to roc__ws_message:
+/// WebSocket message record passed to roc_ws_message:
 /// { message : Str, path : Str } — alphabetical, both RocStr.
 const RocWsFrame = extern struct {
     message: RocStr,
     path: RocStr,
 };
 
-/// Returned by roc__ws_message: { broadcast : Str, reply : Str }.
+/// Returned by roc_ws_message: { broadcast : Str, reply : Str }.
 const RocWsReply = extern struct {
     broadcast: RocStr,
     reply: RocStr,
 };
 
-extern fn roc__ws_message(ops: *RocOps, ret_ptr: *anyopaque, arg_ptr: ?*anyopaque) callconv(.c) void;
+// The app's WS entrypoint, exported under its provides symbol with its
+// natural C ABI, per `provides { ..., "roc_ws_message": ws_for_host! }`.
+extern fn roc_ws_message(frame: RocWsFrame) callconv(.c) RocWsReply;
 
 /// Registry of connected WebSocket clients plus a write lock. One mutex
 /// covers both membership and ALL websocket frame writes: workers handling
@@ -1327,10 +1507,7 @@ fn wsLoop(ops: *RocOps, fd: Fd, path: []const u8, initial: []const u8) void {
                     .message = RocStr.fromSlice(payload[0..len], ops),
                     .path = RocStr.fromSlice(path, ops),
                 };
-                var result: RocWsReply = undefined;
-                {
-                    roc__ws_message(ops, @ptrCast(&result), @constCast(@ptrCast(&frame)));
-                }
+                const result: RocWsReply = roc_ws_message(frame);
                 if (result.reply.asSlice().len > 0) {
                     ws_clients.send(fd, 0x1, result.reply.asSlice());
                 }
@@ -1369,7 +1546,7 @@ fn setSocketTimeouts(fd: Fd) void {
 }
 
 /// Handle one connection: read, parse, call the Roc handler, respond.
-/// Runs on a worker thread; the roc__handle call runs in parallel with
+/// Runs on a worker thread; the roc_handle call runs in parallel with
 /// other workers' calls.
 fn handleConnection(ops: *RocOps, fd: Fd) void {
     defer _ = std.c.close(fd);
@@ -1442,10 +1619,7 @@ fn handleConnection(ops: *RocOps, fd: Fd) void {
             .uri = RocStr.fromSlice(parsed.path, ops),
         };
 
-        var response: RocResponse = undefined;
-        {
-            roc__handle(ops, @ptrCast(&response), @constCast(@ptrCast(&request)));
-        }
+        const response: RocResponse = roc_handle(request);
 
         const keep_alive = !parsed.connection_close and !shutting_down.load(.acquire);
         const suppress_body = std.mem.eql(u8, parsed.method, "HEAD");
@@ -1566,8 +1740,10 @@ fn workerCount() usize {
 // Entry point
 // ============================================================================
 
-// Symbol provided by the Roc runtime, per `provides { handle_for_host!: "handle" }`.
-extern fn roc__handle(ops: *RocOps, ret_ptr: *anyopaque, arg_ptr: ?*anyopaque) callconv(.c) void;
+// The app's HTTP entrypoint, exported under its provides symbol with its
+// natural C ABI, per `provides { "roc_handle": handle_for_host!, ... }`:
+// it takes the request record and returns the response record by value.
+extern fn roc_handle(request: RocRequest) callconv(.c) RocResponse;
 
 comptime {
     if (!@import("builtin").is_test) {
@@ -1629,19 +1805,6 @@ fn listenOn(port: u16) ?Fd {
 fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
     const port = resolvePort(argc, argv);
 
-    var host_env: u8 = 0; // no host state needed (yet)
-
-    var roc_ops = RocOps{
-        .env = @as(*anyopaque, @ptrCast(&host_env)),
-        .roc_alloc = rocAllocFn,
-        .roc_dealloc = rocDeallocFn,
-        .roc_realloc = rocReallocFn,
-        .roc_dbg = rocDbgFn,
-        .roc_expect_failed = rocExpectFailedFn,
-        .roc_crashed = rocCrashedFn,
-        .hosted_fns = hosted_fns,
-    };
-
     const listener_fd = listenOn(port) orelse {
         var err_buf: [96]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "Host error: failed to listen on port {d}\n", .{port}) catch "Host error: failed to listen\n";
@@ -1656,7 +1819,7 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
     const workers = workerCount();
     var spawned: usize = 0;
     while (spawned < workers) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, workerLoop, .{&roc_ops}) catch {
+        threads[spawned] = std.Thread.spawn(.{}, workerLoop, .{&g_roc_ops}) catch {
             printStderr("Host error: failed to spawn worker thread\n");
             return 1;
         };

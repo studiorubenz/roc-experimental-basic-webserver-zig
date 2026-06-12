@@ -14,6 +14,17 @@ rewritten in June 2026 against the then-current compiler conventions.
 
 ## Toolchain (pinned)
 
+**Update 2026-06-12 (round 6):** re-pinned to **roc commit `05d7069072`**
+(checkout `../roc-05d70690`) for the **host symbol ABI** breaking change
+(roc-lang/roc#9613 + #9609): hosted functions are now plain C-ABI symbols
+(arguments/returns by value, no RocOps parameter, no dispatch table)
+exported under names declared in a new `hosted` section of the platform
+header; entrypoints are likewise natural C-ABI symbols named in
+`provides { "symbol": fn }`; the `targets:` section lost its `exe:`
+nesting (`files` → `inputs`). Unused host code is now dead-code-eliminated
+from app binaries, and Roc↔host calls are direct. Everything below this
+section describes round 5 at `48b28c07` and is kept as history.
+
 Since 2026-06-10 (round 5) everything is pinned to **roc commit `48b28c07`**
 (2026-06-09) built with **Zig 0.16.0**:
 

@@ -7,9 +7,9 @@ set -euo pipefail
 # ...) changes its hosted functions or the types crossing the host boundary.
 # The generated file is checked in; `zig build` never needs the compiler tree.
 #
-# Pinned toolchain (see CREATING-AN…md): roc @ 48b28c07.
+# Pinned toolchain (see CREATING-AN…md): roc @ 05d70690.
 # Override with ROC_SRC=/path/to/roc-checkout and/or ROC=/path/to/roc.
-ROC_SRC="${ROC_SRC:-$HOME/Code/roc/roc-48b28c07}"
+ROC_SRC="${ROC_SRC:-$HOME/Code/roc/roc-05d70690}"
 ROC="${ROC:-$ROC_SRC/zig-out/bin/roc}"
 
 cd "$(dirname "$0")"

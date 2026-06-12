@@ -5,15 +5,36 @@ platform ""
     }
     exposes [Stdout, Stderr, Method, Request, Response, Cmd, Dir, Env, File, IOErr, Random, Sleep, Utc]
     packages {}
-    provides { handle_for_host!: "handle", ws_for_host!: "ws_message" }
+    provides { "roc_handle": handle_for_host!, "roc_ws_message": ws_for_host! }
+    hosted {
+        "roc_cmd_host_exec_exit_code": Cmd.host_exec_exit_code!,
+        "roc_cmd_host_exec_output": Cmd.host_exec_output!,
+        "roc_dir_create": Dir.create!,
+        "roc_dir_create_all": Dir.create_all!,
+        "roc_dir_delete_all": Dir.delete_all!,
+        "roc_dir_delete_empty": Dir.delete_empty!,
+        "roc_dir_list": Dir.list!,
+        "roc_env_cwd": Env.cwd!,
+        "roc_env_exe_path": Env.exe_path!,
+        "roc_env_var": Env.var!,
+        "roc_file_delete": File.delete!,
+        "roc_file_read_bytes": File.read_bytes!,
+        "roc_file_read_utf8": File.read_utf8!,
+        "roc_file_write_bytes": File.write_bytes!,
+        "roc_file_write_utf8": File.write_utf8!,
+        "roc_random_seed_u32": Random.seed_u32!,
+        "roc_random_seed_u64": Random.seed_u64!,
+        "roc_sleep_millis": Sleep.millis!,
+        "roc_stderr_line": Stderr.line!,
+        "roc_stdout_line": Stdout.line!,
+        "roc_utc_now": Utc.now!,
+    }
     targets: {
-        files: "targets/",
-        exe: {
-            x64mac: { files: ["libhost.a", app] },
-            arm64mac: { files: ["libhost.a", app] },
-            x64musl: { files: ["crt1.o", "libhost.a", app, "libc.a"] },
-            arm64musl: { files: ["crt1.o", "libhost.a", app, "libc.a"] },
-        }
+        inputs: "targets/",
+        x64mac: { inputs: ["libhost.a", app] },
+        arm64mac: { inputs: ["libhost.a", app] },
+        x64musl: { inputs: ["crt1.o", "libhost.a", app, "libc.a"] },
+        arm64musl: { inputs: ["crt1.o", "libhost.a", app, "libc.a"] },
     }
 
 import Stdout

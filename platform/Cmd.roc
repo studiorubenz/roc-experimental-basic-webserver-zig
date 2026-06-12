@@ -242,7 +242,7 @@ Cmd :: {
     }
 
     # The two host-implemented functions. Vendoring note: basic-cli declares
-    # these at the module's top level, but at our pin (48b28c07) top-level
+    # these at the module's top level, but at the 48b28c07 pin top-level
     # hosted declarations are not in scope inside the type body, so they
     # live here as body-less members instead (hosted = no body, exactly
     # like Utc.now!).

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pinned toolchain (see CREATING-AN…md): roc @ 48b28c07 + Zig 0.16.0.
+# Pinned toolchain (see CREATING-AN…md): roc @ 05d70690 + Zig 0.16.0.
 # Override with ROC=/path/to/roc and/or ZIG=/path/to/zig.
-ROC="${ROC:-$HOME/Code/roc/roc-48b28c07/zig-out/bin/roc}"
+ROC="${ROC:-$HOME/Code/roc/roc-05d70690/zig-out/bin/roc}"
 ZIG="${ZIG:-$HOME/zig-0.16.0/zig}"
 
 if [[ $# -lt 1 ]]; then

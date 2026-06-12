@@ -4,6 +4,7 @@ import pf.Stdout
 import pf.File
 import pf.Request exposing [Request]
 import pf.Response exposing [Response]
+import "page.html" as page : Str
 
 # The compiled Elm bundle is read from disk per request (the server runs
 # from the repo root, hence the examples/... path). Re-run `elm make` and
@@ -49,7 +50,9 @@ handle! = |request| {
 
 on_ws! : { message : Str, path : Str } => { broadcast : Str, reply : Str }
 on_ws! = |frame| {
-    Stdout.line!("ws: ${frame.message}")
+    # dbg rather than Stdout: stripped from optimized builds, so it can't
+    # slow down benchmarks.
+    dbg frame.message
     match frame.message.split_on("\t") {
         [name, text] => route_message(name, text)
         _ => { broadcast: "", reply: "malformed message (expected name<TAB>text)" }
@@ -71,29 +74,3 @@ route_message = |name, text|
 expect route_message("ada", "hi there").broadcast == "ada: hi there"
 expect route_message("ada", "/joined").broadcast == "* ada joined the chat"
 expect route_message("ada", "/help").broadcast == ""
-
-# -- Page ------------------------------------------------------------------------
-# Just the Elm mount point and the WebSocket/port glue (Elm 0.19 has no
-# built-in WebSockets). Plain JS: Roc multiline strings interpolate ${...},
-# so no JS template literals in here.
-
-page : Str
-page =
-    \\<html lang="en">
-    \\<head>
-    \\    <meta charset="utf-8">
-    \\    <title>Roc + Elm chat</title>
-    \\    <script src="/elm.js"></script>
-    \\</head>
-    \\<body>
-    \\    <div id="app"></div>
-    \\    <script>
-    \\    var app = Elm.Main.init({ node: document.getElementById("app") });
-    \\    var ws = new WebSocket("ws://" + location.host + "/ws");
-    \\    ws.onopen = function () { app.ports.socketState.send(true); };
-    \\    ws.onclose = function () { app.ports.socketState.send(false); };
-    \\    ws.onmessage = function (event) { app.ports.messageReceived.send(event.data); };
-    \\    app.ports.sendMessage.subscribe(function (message) { ws.send(message); });
-    \\    </script>
-    \\</body>
-    \\</html>

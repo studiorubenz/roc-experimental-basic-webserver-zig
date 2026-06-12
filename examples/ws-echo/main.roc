@@ -3,6 +3,7 @@ app [handle!, on_ws!] { pf: platform "../../platform/main.roc" }
 import pf.Stdout
 import pf.Request exposing [Request]
 import pf.Response exposing [Response]
+import "page.html" as chat_page : Str
 
 # -- HTTP: serve the chat page --------------------------------------------------
 
@@ -27,7 +28,9 @@ handle! = |request| {
 ## Everything is a private reply to the sender; see examples/chat for broadcast.
 on_ws! : { message : Str, path : Str } => { broadcast : Str, reply : Str }
 on_ws! = |frame| {
-    Stdout.line!("ws ${frame.path}: ${frame.message}")
+    # dbg rather than Stdout: stripped from optimized builds, so it can't
+    # slow down benchmarks.
+    dbg frame
     { broadcast: "", reply: answer(frame.message) }
 }
 
@@ -72,43 +75,3 @@ prepend_words = |remaining, reversed|
 
 expect ascii_upper("hello Jörg!") == "HELLO Jörg!"
 expect reverse_words("one two three") == "three two one"
-
-# -- Page ------------------------------------------------------------------------
-# (Plain JS on purpose: Roc multiline strings interpolate ${...}, so no JS
-# template literals in here.)
-
-chat_page : Str
-chat_page =
-    \\<html lang="en">
-    \\<head>
-    \\    <meta charset="utf-8">
-    \\    <title>Roc WebSocket echo</title>
-    \\</head>
-    \\<body>
-    \\    <h1>Roc WebSocket echo</h1>
-    \\    <p>Try <code>/help</code>, <code>/upper roc</code>, <code>/reverse one two three</code>, <code>/count some words</code>.</p>
-    \\    <ul id="log"></ul>
-    \\    <form onsubmit="send(); return false;">
-    \\        <input id="msg" autocomplete="off" placeholder="Say something...">
-    \\        <button>Send</button>
-    \\    </form>
-    \\    <script>
-    \\    var ws = new WebSocket("ws://" + location.host + "/ws");
-    \\    ws.onopen = function () { add("[connected]"); };
-    \\    ws.onclose = function () { add("[disconnected]"); };
-    \\    ws.onmessage = function (event) { add("server: " + event.data); };
-    \\    function add(line) {
-    \\        var item = document.createElement("li");
-    \\        item.textContent = line;
-    \\        document.getElementById("log").appendChild(item);
-    \\    }
-    \\    function send() {
-    \\        var input = document.getElementById("msg");
-    \\        if (input.value === "") { return; }
-    \\        add("you: " + input.value);
-    \\        ws.send(input.value);
-    \\        input.value = "";
-    \\    }
-    \\    </script>
-    \\</body>
-    \\</html>

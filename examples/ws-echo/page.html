@@ -1,0 +1,35 @@
+<!-- Ingested into main.roc at build time (import "page.html" as chat_page),
+     so editing this file requires a server rebuild. -->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Roc WebSocket echo</title>
+</head>
+<body>
+    <h1>Roc WebSocket echo</h1>
+    <p>Try <code>/help</code>, <code>/upper roc</code>, <code>/reverse one two three</code>, <code>/count some words</code>.</p>
+    <ul id="log"></ul>
+    <form onsubmit="send(); return false;">
+        <input id="msg" autocomplete="off" placeholder="Say something...">
+        <button>Send</button>
+    </form>
+    <script>
+    var ws = new WebSocket("ws://" + location.host + "/ws");
+    ws.onopen = function () { add("[connected]"); };
+    ws.onclose = function () { add("[disconnected]"); };
+    ws.onmessage = function (event) { add("server: " + event.data); };
+    function add(line) {
+        var item = document.createElement("li");
+        item.textContent = line;
+        document.getElementById("log").appendChild(item);
+    }
+    function send() {
+        var input = document.getElementById("msg");
+        if (input.value === "") { return; }
+        add("you: " + input.value);
+        ws.send(input.value);
+        input.value = "";
+    }
+    </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+<!-- Ingested into main.roc at build time (import "page.html" as page), so
+     editing this file requires a server rebuild. Just the Elm mount point
+     and the WebSocket/port glue (Elm 0.19 has no built-in WebSockets). -->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Roc + Elm chat</title>
+    <script src="/elm.js"></script>
+</head>
+<body>
+    <div id="app"></div>
+    <script>
+    var app = Elm.Main.init({ node: document.getElementById("app") });
+    var ws = new WebSocket("ws://" + location.host + "/ws");
+    ws.onopen = function () { app.ports.socketState.send(true); };
+    ws.onclose = function () { app.ports.socketState.send(false); };
+    ws.onmessage = function (event) { app.ports.messageReceived.send(event.data); };
+    app.ports.sendMessage.subscribe(function (message) { ws.send(message); });
+    </script>
+</body>
+</html>

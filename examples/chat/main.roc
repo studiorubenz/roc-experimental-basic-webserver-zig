@@ -3,6 +3,7 @@ app [handle!, on_ws!] { pf: platform "../../platform/main.roc" }
 import pf.Stdout
 import pf.Request exposing [Request]
 import pf.Response exposing [Response]
+import "chat.html" as chat_page : Str
 
 # -- HTTP: serve the chat page --------------------------------------------------
 
@@ -28,7 +29,9 @@ handle! = |request| {
 
 on_ws! : { message : Str, path : Str } => { broadcast : Str, reply : Str }
 on_ws! = |frame| {
-    Stdout.line!("ws: ${frame.message}")
+    # dbg rather than Stdout: stripped from optimized builds, so it can't
+    # slow down benchmarks.
+    dbg frame.message
     match frame.message.split_on("\t") {
         [name, text] => route_message(name, text)
         _ => { broadcast: "", reply: "malformed message (expected name<TAB>text)" }
@@ -48,14 +51,15 @@ route_message = |name, text|
     }
 
 ## Escape &, <, >, " and ' — chat text is rendered as HTML on the page.
+## `&` must be first, or it would double-escape the `&` in `&lt;` etc.
 escape_html : Str -> Str
-escape_html = |input| {
-    amp = replace_all(input, "&", "&amp;")
-    lt = replace_all(amp, "<", "&lt;")
-    gt = replace_all(lt, ">", "&gt;")
-    quot = replace_all(gt, "\"", "&quot;")
-    replace_all(quot, "'", "&#39;")
-}
+escape_html = |input|
+    input
+        ->replace_all("&", "&amp;")
+        ->replace_all("<", "&lt;")
+        ->replace_all(">", "&gt;")
+        ->replace_all("\"", "&quot;")
+        ->replace_all("'", "&#39;")
 
 replace_all : Str, Str, Str -> Str
 replace_all = |haystack, needle, replacement|
@@ -64,45 +68,3 @@ replace_all = |haystack, needle, replacement|
 expect route_message("ada", "hi <all>").broadcast == "<b>ada:</b> hi &lt;all&gt;"
 expect route_message("ada", "/me waves").broadcast == "* ada waves"
 expect route_message("ada", "/help").broadcast == ""
-
-# -- Page ------------------------------------------------------------------------
-# (Plain JS on purpose: Roc multiline strings interpolate ${...}, so no JS
-# template literals in here. Server output is HTML-escaped in Roc and
-# rendered via innerHTML so <b>name:</b> formatting works.)
-
-chat_page : Str
-chat_page =
-    \\<html lang="en">
-    \\<head>
-    \\    <meta charset="utf-8">
-    \\    <title>Roc chat</title>
-    \\</head>
-    \\<body>
-    \\    <h1>Roc chat</h1>
-    \\    <p>Open this page in several tabs and chat between them. <code>/help</code> for commands.</p>
-    \\    <ul id="log"></ul>
-    \\    <form onsubmit="send(); return false;">
-    \\        <input id="msg" autocomplete="off" placeholder="Say something...">
-    \\        <button>Send</button>
-    \\    </form>
-    \\    <script>
-    \\    var name = "";
-    \\    while (name === "") { name = (prompt("Your name?") || "").trim(); }
-    \\    var ws = new WebSocket("ws://" + location.host + "/ws");
-    \\    ws.onopen = function () { ws.send(name + "\t/joined"); };
-    \\    ws.onclose = function () { add("[disconnected]"); };
-    \\    ws.onmessage = function (event) { add(event.data); };
-    \\    function add(html) {
-    \\        var item = document.createElement("li");
-    \\        item.innerHTML = html;
-    \\        document.getElementById("log").appendChild(item);
-    \\    }
-    \\    function send() {
-    \\        var input = document.getElementById("msg");
-    \\        if (input.value === "") { return; }
-    \\        ws.send(name + "\t" + input.value);
-    \\        input.value = "";
-    \\    }
-    \\    </script>
-    \\</body>
-    \\</html>

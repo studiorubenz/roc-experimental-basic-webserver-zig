@@ -402,21 +402,23 @@ hex_value = |byte|
     }
 
 ## Escape &, <, >, " and ' for safe interpolation into HTML.
+## `&` must be first, or it would double-escape the `&` in `&lt;` etc.
 escape_html : Str -> Str
-escape_html = |input| {
-    amp = replace_all(input, "&", "&amp;")
-    lt = replace_all(amp, "<", "&lt;")
-    gt = replace_all(lt, ">", "&gt;")
-    quot = replace_all(gt, "\"", "&quot;")
-    replace_all(quot, "'", "&#39;")
-}
+escape_html = |input|
+    input
+        ->replace_all("&", "&amp;")
+        ->replace_all("<", "&lt;")
+        ->replace_all(">", "&gt;")
+        ->replace_all("\"", "&quot;")
+        ->replace_all("'", "&#39;")
 
-## Escape backslash and double quote for JSON strings.
+## Escape backslash and double quote for JSON strings (backslash first,
+## or it would re-escape the backslashes added for quotes).
 json_escape : Str -> Str
-json_escape = |input| {
-    backslashes = replace_all(input, "\\", "\\\\")
-    replace_all(backslashes, "\"", "\\\"")
-}
+json_escape = |input|
+    input
+        ->replace_all("\\", "\\\\")
+        ->replace_all("\"", "\\\"")
 
 expect split_query("/echo?msg=hi&x=2") == { path: "/echo", query: "msg=hi&x=2" }
 expect split_query("/plain") == { path: "/plain", query: "" }
